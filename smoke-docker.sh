@@ -23,6 +23,15 @@ req = urllib.request.Request(
     headers={"Content-Type": "application/json"})
 print(json.dumps(json.loads(urllib.request.urlopen(req).read()), ensure_ascii=False, indent=2))
 print(urllib.request.urlopen("http://localhost:8000/patches").read().decode())
+
+# 按当前版号发布 WKT 面清单，再查询
+ver = json.loads(urllib.request.urlopen("http://localhost:8000/health").read())["version"]
+body = json.dumps({"source_version": ver}).encode()
+req = urllib.request.Request(
+    "http://localhost:8000/publications", data=body, method="POST",
+    headers={"Content-Type": "application/json"})
+print(json.dumps(json.loads(urllib.request.urlopen(req).read()), ensure_ascii=False, indent=2))
+print(urllib.request.urlopen("http://localhost:8000/publications/current").read().decode())
 PY
 
 echo "Docs: http://localhost:8000/docs"

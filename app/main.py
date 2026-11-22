@@ -8,22 +8,28 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .config import DB_PATH, IDEMPOTENCY_CONFLICT_STATUS
+from .config import DB_PATH, IDEMPOTENCY_CONFLICT_STATUS, PUBLISH_CONFLICT_STATUS
 from .db import (
     IdempotencyConflict,
+    PublishConflict,
     apply_correction,
     connect,
     current_version,
+    get_current_manifest,
     get_receipt,
     init_db,
     list_patches,
     list_tiles,
+    publish,
 )
 from .schemas import (
     CorrectionReceipt,
     CorrectionRequest,
     HealthResponse,
     PatchListResponse,
+    PublicationManifest,
+    PublishReceipt,
+    PublishRequest,
     TileListResponse,
 )
 
@@ -42,6 +48,8 @@ app = FastAPI(
         "凭批号、整数瓦片行列和 16×16 二值水面掩膜新增/替换一片水面瓦片；"
         "按四邻接划分斑块（可跨片），斑块编号取最小全局像元坐标（先行后列），"
         "只增量重算受影响斑块，所有更正带版本号与回执。"
+        "发布接口把指定版号的全部斑块转成 WKT 面清单（含内孔，"
+        "像元为单位方格，左上角取 (全局列, 负全局行)），整版生效后供下游查询。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -111,6 +119,44 @@ def get_patches(
 def get_tiles(conn=Depends(get_conn)):
     version, tiles = list_tiles(conn)
     return TileListResponse(version=version, tile_count=len(tiles), tiles=tiles)
+
+
+@app.post(
+    "/publications",
+    response_model=PublishReceipt,
+    status_code=201,
+    summary="发布：把指定版号的全部斑块转成 WKT 面清单，整版生效",
+    responses={
+        PUBLISH_CONFLICT_STATUS: {
+            "description": "源版号已变化（转换期间有新更正入库或版号过期），发布冲突"
+        }
+    },
+)
+def post_publication(req: PublishRequest, conn=Depends(get_conn)):
+    try:
+        return publish(conn, DB_PATH, req.source_version)
+    except PublishConflict as exc:
+        raise HTTPException(
+            status_code=PUBLISH_CONFLICT_STATUS,
+            detail={
+                "error": "source_version_conflict",
+                "source_version": exc.source_version,
+                "current_version": exc.current_version,
+                "message": str(exc),
+            },
+        )
+
+
+@app.get(
+    "/publications/current",
+    response_model=PublicationManifest,
+    summary="下游查询：当前已发布的斑块面清单（编号、WKT 边界、源版号）",
+)
+def get_publication_current(conn=Depends(get_conn)):
+    manifest = get_current_manifest(conn)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="尚未发布任何斑块面清单")
+    return manifest
 
 
 @app.get("/health", response_model=HealthResponse, summary="健康检查")

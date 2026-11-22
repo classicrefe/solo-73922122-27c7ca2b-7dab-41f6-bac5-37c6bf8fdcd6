@@ -104,3 +104,51 @@ class TileListResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: int
+
+
+class PublishRequest(BaseModel):
+    """发布请求：把指定瓦片库版号的全部斑块转成 WKT 面清单并整版生效。"""
+
+    source_version: int = Field(
+        ..., ge=0, description="要发布的瓦片库版号；发布时若已变化则返回 409"
+    )
+
+
+class PublishedPatch(BaseModel):
+    """已发布清单中的一个斑块面。"""
+
+    patch_id: str = Field(..., description="斑块编号")
+    wkt: str = Field(
+        ...,
+        description="WKT 面（POLYGON/MULTIPOLYGON），x=全局列，y=-全局行，含内孔",
+    )
+    pixel_count: int = Field(..., description="覆盖的水面像元数")
+
+
+class PublishedPatchResult(PublishedPatch):
+    """发布回执中的斑块条目，额外标注是否沿用上次发布边界。"""
+
+    reused: bool = Field(
+        ..., description="True=像元集合与上次发布相同，沿用原边界；False=重新转换"
+    )
+
+
+class PublishReceipt(BaseModel):
+    """发布回执：新清单整版生效后的摘要。"""
+
+    release_no: int = Field(..., description="发布序号（从 1 起，每次成功发布 +1）")
+    source_version: int = Field(..., description="本清单对应的瓦片库版号")
+    patch_count: int
+    converted_count: int = Field(..., description="本次重新转换的斑块数（含同号改形）")
+    reused_count: int = Field(..., description="像元集合未变、沿用原边界的斑块数")
+    removed_count: int = Field(..., description="已消失、从新清单移除的斑块数")
+    patches: list[PublishedPatchResult]
+
+
+class PublicationManifest(BaseModel):
+    """下游查询：当前生效的斑块面清单。"""
+
+    release_no: int = Field(..., description="发布序号")
+    source_version: int = Field(..., description="清单来源的瓦片库版号")
+    patch_count: int
+    patches: list[PublishedPatch]

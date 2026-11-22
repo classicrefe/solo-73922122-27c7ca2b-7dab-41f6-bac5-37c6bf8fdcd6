@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -21,7 +22,16 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .config import TILE_SIZE
-from .schemas import CorrectionReceipt, CorrectionRequest, Patch
+from .geometry import pixels_to_wkt
+from .schemas import (
+    CorrectionReceipt,
+    CorrectionRequest,
+    Patch,
+    PublicationManifest,
+    PublishedPatch,
+    PublishedPatchResult,
+    PublishReceipt,
+)
 
 # ---------------------------------------------------------------------------
 # 进程内串行锁（单 worker 下保证并发更正严格串行；多 worker 时再由
@@ -36,6 +46,18 @@ class IdempotencyConflict(Exception):
     def __init__(self, batch_id: str):
         self.batch_id = batch_id
         super().__init__(f"批号 {batch_id!r} 已用于不同内容的更正，请求被拒收")
+
+
+class PublishConflict(Exception):
+    """发布时源版号已变化（转换期间有新更正入库，或客户端版号过期）。"""
+
+    def __init__(self, source_version: int, current_version: int):
+        self.source_version = source_version
+        self.current_version = current_version
+        super().__init__(
+            f"源版号 {source_version} 已失效（当前版号 {current_version}），"
+            "请按最新版号重新发布"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +164,24 @@ CREATE TABLE IF NOT EXISTS receipts (
     version  INTEGER NOT NULL,
     request_fingerprint TEXT NOT NULL,
     payload_json TEXT NOT NULL
+);
+
+-- 发布成果：release_no=0 / source_version=-1 表示尚未发布。
+CREATE TABLE IF NOT EXISTS publication_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    release_no INTEGER NOT NULL DEFAULT 0,
+    source_version INTEGER NOT NULL DEFAULT -1
+);
+INSERT OR IGNORE INTO publication_meta(id, release_no, source_version) VALUES (1, 0, -1);
+
+-- 当前生效的斑块面清单（整版切换：发布事务内整体删除并重写）。
+CREATE TABLE IF NOT EXISTS published_patches (
+    patch_id TEXT PRIMARY KEY,
+    wkt TEXT NOT NULL,
+    pixel_hash TEXT NOT NULL,
+    pixel_count INTEGER NOT NULL,
+    release_no INTEGER NOT NULL,
+    source_version INTEGER NOT NULL
 );
 """
 
@@ -484,3 +524,181 @@ def list_tiles(conn: sqlite3.Connection) -> tuple[int, list[dict]]:
         """
     ).fetchall()
     return version, [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 发布：斑块 -> WKT 面清单（三段式：快照 -> 转换 -> 整版提交）
+# ---------------------------------------------------------------------------
+def pixel_set_hash(pixels: set[tuple[int, int]]) -> str:
+    """像元集合指纹：判定"与上次发布相同"以沿用原边界。"""
+    raw = ";".join(f"{r},{c}" for r, c in sorted(pixels))
+    return hashlib.sha256(raw.encode("ascii")).hexdigest()
+
+
+def snapshot_for_publish(
+    db_path: Path, source_version: int
+) -> tuple[list[tuple[str, set[tuple[int, int]]]], dict[str, tuple[str, str]]]:
+    """独立只读连接打一致性快照：校验源版号，取出该版全部斑块像元与上次发布清单。
+
+    返回 (按编号排序的 [(patch_id, 像元集合)], {patch_id: (pixel_hash, wkt)})。
+    快照事务不持有写锁，转换期间更正仍可正常入库；若快照时版号已变，
+    立即抛 PublishConflict。
+    """
+    snap = connect(db_path)
+    try:
+        snap.execute("BEGIN")
+        try:
+            ver = current_version(snap)
+            if ver != source_version:
+                raise PublishConflict(source_version, ver)
+            patches: dict[str, set[tuple[int, int]]] = {}
+            for r in snap.execute("SELECT patch_id, gr, gc FROM patch_pixels"):
+                patches.setdefault(r["patch_id"], set()).add((r["gr"], r["gc"]))
+            old = {
+                r["patch_id"]: (r["pixel_hash"], r["wkt"])
+                for r in snap.execute(
+                    "SELECT patch_id, pixel_hash, wkt FROM published_patches"
+                )
+            }
+            snap.execute("COMMIT")
+        except Exception:
+            snap.execute("ROLLBACK")
+            raise
+    finally:
+        snap.close()
+    ordered = sorted(patches.items(), key=lambda kv: parse_patch_id(kv[0]))
+    return ordered, old
+
+
+def build_manifest(
+    patches: list[tuple[str, set[tuple[int, int]]]],
+    old_manifest: dict[str, tuple[str, str]],
+) -> tuple[list[dict], int, int, int]:
+    """纯函数转换：像元集合与上次发布相同的斑块沿用原边界，否则重新转换。
+
+    返回 (清单条目, 重新转换数, 沿用数, 移除数)。不触碰数据库，
+    因此转换期间瓦片更正可并发入库。
+    """
+    entries: list[dict] = []
+    converted = reused = 0
+    for pid, pxs in patches:
+        h = pixel_set_hash(pxs)
+        old = old_manifest.get(pid)
+        if old is not None and old[0] == h:
+            # 像元集合与上次发布相同：沿用原边界
+            wkt, flag = old[1], True
+            reused += 1
+        else:
+            # 新斑块，或同号斑块像元有变化：重新转换
+            wkt, flag = pixels_to_wkt(pxs), False
+            converted += 1
+        entries.append(
+            {
+                "patch_id": pid,
+                "wkt": wkt,
+                "pixel_hash": h,
+                "pixel_count": len(pxs),
+                "reused": flag,
+            }
+        )
+    removed = len(set(old_manifest) - {pid for pid, _ in patches})
+    return entries, converted, reused, removed
+
+
+def commit_manifest(
+    conn: sqlite3.Connection, source_version: int, entries: list[dict]
+) -> int:
+    """整版提交：单事务内复验源版号、清空旧清单、写入新清单。
+
+    版号已变 -> PublishConflict 回滚；任何写库异常整体回滚，
+    原发布成果保持可查。返回新发布序号。
+    """
+    with _write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ver = current_version(conn)
+            if ver != source_version:
+                raise PublishConflict(source_version, ver)
+            release_no = int(
+                conn.execute(
+                    "SELECT release_no FROM publication_meta WHERE id=1"
+                ).fetchone()[0]
+            ) + 1
+            conn.execute("DELETE FROM published_patches")
+            conn.executemany(
+                "INSERT INTO published_patches"
+                "(patch_id, wkt, pixel_hash, pixel_count, release_no, source_version)"
+                " VALUES (?,?,?,?,?,?)",
+                [
+                    (
+                        e["patch_id"],
+                        e["wkt"],
+                        e["pixel_hash"],
+                        e["pixel_count"],
+                        release_no,
+                        source_version,
+                    )
+                    for e in entries
+                ],
+            )
+            conn.execute(
+                "UPDATE publication_meta SET release_no=?, source_version=? WHERE id=1",
+                (release_no, source_version),
+            )
+            conn.execute("COMMIT")
+            return release_no
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def publish(
+    conn: sqlite3.Connection, db_path: Path, source_version: int
+) -> PublishReceipt:
+    """发布主流程：快照 -> 转换（不持锁）-> 整版提交（复验版号）。
+
+    转换或提交任一环节失败，已发布清单保持原样可查。
+    """
+    patches, old_manifest = snapshot_for_publish(db_path, source_version)
+    entries, converted, reused, removed = build_manifest(patches, old_manifest)
+    release_no = commit_manifest(conn, source_version, entries)
+    return PublishReceipt(
+        release_no=release_no,
+        source_version=source_version,
+        patch_count=len(entries),
+        converted_count=converted,
+        reused_count=reused,
+        removed_count=removed,
+        patches=[
+            PublishedPatchResult(
+                patch_id=e["patch_id"],
+                wkt=e["wkt"],
+                pixel_count=e["pixel_count"],
+                reused=e["reused"],
+            )
+            for e in entries
+        ],
+    )
+
+
+def get_current_manifest(conn: sqlite3.Connection) -> PublicationManifest | None:
+    """下游查询：当前生效的斑块面清单。尚未发布时返回 None。"""
+    meta = conn.execute(
+        "SELECT release_no, source_version FROM publication_meta WHERE id=1"
+    ).fetchone()
+    if meta["release_no"] == 0:
+        return None
+    rows = conn.execute(
+        "SELECT patch_id, wkt, pixel_count FROM published_patches ORDER BY patch_id"
+    ).fetchall()
+    return PublicationManifest(
+        release_no=meta["release_no"],
+        source_version=meta["source_version"],
+        patch_count=len(rows),
+        patches=[
+            PublishedPatch(
+                patch_id=r["patch_id"], wkt=r["wkt"], pixel_count=r["pixel_count"]
+            )
+            for r in rows
+        ],
+    )

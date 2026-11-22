@@ -13,3 +13,6 @@ TILE_SIZE = 16
 
 # 同批号异内容时返回的 HTTP 状态（409 Conflict）。
 IDEMPOTENCY_CONFLICT_STATUS = 409
+
+# 发布时源版号已变化返回的 HTTP 状态（409 Conflict）。
+PUBLISH_CONFLICT_STATUS = 409

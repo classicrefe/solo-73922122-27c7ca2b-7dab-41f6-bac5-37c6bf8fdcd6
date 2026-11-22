@@ -26,6 +26,25 @@
   `parent_version` 以入仓时的上一版为准。
 - **失败安全**：任何写库异常整体回滚，下游始终能读到最近一次成功版本与完整斑块清单。
 
+## 发布：斑块 -> WKT 面清单（GIS 图层）
+
+制图侧可把某一版瓦片库的斑块整版发布为 WKT 面清单，供 GIS 当面图层使用。
+
+- **坐标约定**：像元为单位方格，左上角坐标取 **(全局列, 负全局行)**，即 x=全局列、
+  y=-全局行，方格覆盖 x∈[col, col+1]、y∈[-row-1, -row]。外环逆时针、内孔顺时针，
+  输出 `POLYGON`（含内孔环）；仅对角相接的输入会拆成 `MULTIPOLYGON`（防御性分支，
+  四邻接斑块不会触发）。覆盖范围与水像元并集**精确一致**，内孔保留。
+- **三段式发布**：快照（独立只读连接，校验源版号）→ 转换（不持写锁，
+  **期间瓦片更正照常入库**）→ 整版提交（单事务复验版号、整体换清单）。
+- **增量转换**：像元集合与上次发布相同的斑块**沿用原边界**；同号但像元有变化的
+  斑块重新转换；已消失的斑块从新清单移除。回执给出
+  `converted_count` / `reused_count` / `removed_count`。
+- **冲突**：提交时源版号已变（转换期间来了新更正，或版号本就过期）→ **HTTP 409**，
+  原清单不动，按最新版号重新发布即可。
+- **失败安全**：转换或提交任一环节失败，已发布清单保持原样可查。
+- **查询**：`GET /publications/current` 返回当前生效清单的发布序号、源版号、
+  各斑块编号与 WKT 边界；尚未发布时返回 404。
+
 ## 接口
 
 启动后访问交互式文档：<http://localhost:8000/docs>
@@ -36,6 +55,8 @@
 | GET  | `/corrections/{batch_id}` | 按批号查历史回执 |
 | GET  | `/patches` | 最新完整斑块清单；可用 `tile_row`/`tile_col` 过滤（跨片斑块仍返回完整像元） |
 | GET  | `/tiles` | 已入库瓦片清单（含写入批号、版本、水面像元数） |
+| POST | `/publications` | 发布：把 `source_version` 版的全部斑块转成 WKT 面清单并整版生效（201；版号已变 409） |
+| GET  | `/publications/current` | 当前已发布的斑块面清单（编号、WKT 边界、源版号；未发布 404） |
 | GET  | `/health` | 健康检查与当前版本 |
 
 ### 请求示例
@@ -80,6 +101,42 @@ curl -X POST http://localhost:8000/corrections \
 }
 ```
 
+### 发布示例
+
+```bash
+# 1. 看当前瓦片库版号
+curl -s http://localhost:8000/health        # {"status":"ok","version":2}
+
+# 2. 按该版号发布
+curl -X POST http://localhost:8000/publications \
+  -H "Content-Type: application/json" \
+  -d '{"source_version": 2}'
+
+# 3. 下游查询当前生效的面清单（编号、WKT 边界、源版号）
+curl -s http://localhost:8000/publications/current
+```
+
+发布回执示例：
+
+```json
+{
+  "release_no": 1,
+  "source_version": 2,
+  "patch_count": 1,
+  "converted_count": 1,
+  "reused_count": 0,
+  "removed_count": 0,
+  "patches": [
+    {
+      "patch_id": "(15,0)",
+      "wkt": "POLYGON((0 -15, 2 -15, 2 -17, 0 -17, 0 -15))",
+      "pixel_count": 4,
+      "reused": false
+    }
+  ]
+}
+```
+
 ## 运行
 
 ### Docker Compose（推荐）
@@ -108,7 +165,9 @@ pytest
 ```
 
 测试覆盖：掩膜编解码、负坐标瓦片、四邻接连通、跨片合并、斑块拆分（残部落其他瓦片）、
-增量范围（远处斑块不动）、幂等重传/异内容拒收、并发更正版本链、写库失败回滚、HTTP 层校验。
+增量范围（远处斑块不动）、幂等重传/异内容拒收、并发更正版本链、写库失败回滚、HTTP 层校验；
+WKT 面转换（坐标映射、覆盖一致性、内孔、对角掐点、确定性）、发布三段式（增量沿用、
+同号改形重转、消失移除、版号冲突、转换/提交失败回滚、发布与更正并发）。
 
 ## 目录结构
 
@@ -116,7 +175,8 @@ pytest
 app/
   config.py    # 环境变量配置
   schemas.py   # Pydantic 请求/响应模型与内容指纹
-  db.py        # SQLite 表结构、增量斑块重算、事务、幂等、查询
+  geometry.py  # 像元集合 -> WKT 面（边界缝合、内孔、掐点拆分）
+  db.py        # SQLite 表结构、增量斑块重算、事务、幂等、发布三段式、查询
   main.py      # FastAPI 路由
 tests/         # pytest 测试
 Dockerfile
